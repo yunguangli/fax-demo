@@ -2,6 +2,7 @@
 
 from .components import ImagePanel, StatusBar, PLACEHOLDER_PNG_B64
 from .fax_view import build_fax_view
+from .line_panel import LinePanel
 from .reader_view import build_reader_view
 
 __all__ = [
@@ -10,4 +11,5 @@ __all__ = [
     "PLACEHOLDER_PNG_B64",
     "build_fax_view",
     "build_reader_view",
+    "LinePanel",
 ]

@@ -12,7 +12,7 @@ from .scanner import (
     DEFAULT_THRESHOLD,
     DEFAULT_INVERT,
 )
-from .receiver import render_png_b64, image_to_png_b64
+from .receiver import render_png_b64, image_to_png_b64, ProgressiveFax
 
 __all__ = [
     "FaxDocument",
@@ -24,6 +24,7 @@ __all__ = [
     "original_png_b64",
     "render_png_b64",
     "image_to_png_b64",
+    "ProgressiveFax",
     "DEFAULT_RESOLUTION",
     "DEFAULT_THRESHOLD",
     "DEFAULT_INVERT",

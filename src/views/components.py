@@ -8,14 +8,37 @@ them to ViewModel state.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Awaitable, Callable
 
 import flet as ft
 
+_spawned_tasks: set[asyncio.Task] = set()
+_log = logging.getLogger(__name__)
+
+
+def _on_spawn_done(task: asyncio.Task) -> None:
+    _spawned_tasks.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        _log.error(
+            "Unhandled error in spawned handler",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
 
 def spawn(coro_func: Callable[[], Awaitable[None]]) -> None:
-    """Fire-and-forget an async callable from a sync on_click handler."""
-    asyncio.create_task(coro_func())
+    """Fire-and-forget an async callable from a sync on_click handler.
+
+    Keeps a strong reference until the task finishes so it cannot be
+    garbage-collected mid-flight, and logs exceptions that would otherwise
+    disappear silently (handlers normally report errors via vm.set_status).
+    """
+    task = asyncio.create_task(coro_func())
+    _spawned_tasks.add(task)
+    task.add_done_callback(_on_spawn_done)
 
 # A 1x1 transparent PNG used as the initial image placeholder so ft.Image
 # always has a valid src (avoids rendering errors before any scan/load).
@@ -219,6 +242,10 @@ def make_control_bar(
 
     `source_row` and `action_row` are `ft.Row` controls already containing the
     buttons (e.g. `ft.Row(controls=[load_btn, camera_btn])`).
+
+    Returns the bar control and a `refresh(resolution, threshold, invert)`
+    callable that syncs the widget values from the ViewModel — needed after
+    loading a fax whose parameters differ from the current UI state.
     """
     resolution_dd = ft.Dropdown(
         value=str(resolution),
@@ -250,32 +277,40 @@ def make_control_bar(
         on_change=lambda e: on_invert(bool(invert_switch.value)),
     )
 
-    return ft.Container(
-        bgcolor=ft.Colors.GREY_900,
-        border_radius=ft.BorderRadius.all(6),
-        padding=ft.Padding.all(10),
-        content=ft.Column(
-            controls=[
-                ft.Row(
-                    controls=[resolution_dd, invert_switch],
-                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                    spacing=12,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                ),
-                ft.Column(
-                    controls=[
-                        ft.Text(
-                            value="Threshold",
-                            size=11,
-                            color=ft.Colors.GREY_400,
-                        ),
-                        threshold_slider,
-                    ],
-                    spacing=2,
-                ),
-                source_row,
-                action_row,
-            ],
-            spacing=10,
+    def refresh(resolution: int, threshold: int, invert: bool) -> None:
+        resolution_dd.value = str(resolution)
+        threshold_slider.value = threshold
+        invert_switch.value = invert
+
+    return (
+        ft.Container(
+            bgcolor=ft.Colors.GREY_900,
+            border_radius=ft.BorderRadius.all(6),
+            padding=ft.Padding.all(10),
+            content=ft.Column(
+                controls=[
+                    ft.Row(
+                        controls=[resolution_dd, invert_switch],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        spacing=12,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    ft.Column(
+                        controls=[
+                            ft.Text(
+                                value="Threshold",
+                                size=11,
+                                color=ft.Colors.GREY_400,
+                            ),
+                            threshold_slider,
+                        ],
+                        spacing=2,
+                    ),
+                    source_row,
+                    action_row,
+                ],
+                spacing=10,
+            ),
         ),
+        refresh,
     )

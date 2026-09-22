@@ -13,6 +13,7 @@ to re-scan from the cached bytes anyway.
 
 from __future__ import annotations
 
+import time
 from typing import Callable, Optional
 
 from models import (
@@ -20,11 +21,17 @@ from models import (
     DEFAULT_RESOLUTION,
     DEFAULT_THRESHOLD,
     FaxDocument,
+    ProgressiveFax,
     image_to_png_b64,
     original_png_b64,
     render_png_b64,
     scan_stages_from_bytes,
 )
+
+# Progressive-receive render cadence: how often the partial image is
+# re-encoded while rows stream in (~25 fps — fast enough that the page
+# visibly fills line by line instead of popping in at the end).
+_RENDER_INTERVAL = 0.04
 
 
 class FaxViewModel:
@@ -48,6 +55,11 @@ class FaxViewModel:
         # Whether a scan has actually been run (so slider re-preview only
         # fires after an explicit scan, not merely after picking a source).
         self._has_scanned: bool = False
+
+        # Progressive receive (network path)
+        self._incoming: Optional[ProgressiveFax] = None
+        self._incoming_sender: str = ""
+        self._incoming_last_render: float = 0.0
 
         # Status
         self.status: str = "Load or capture an image, then tap Scan."
@@ -213,5 +225,70 @@ class FaxViewModel:
         self.payload_size = 0
         self.dimensions = ""
         self._has_scanned = False
+        self._incoming = None
         self.status = "Cleared."
+        self._notify()
+
+    # ---- P2P receive (bridged from the network layer in main.py) ----
+
+    @property
+    def is_receiving(self) -> bool:
+        return self._incoming is not None
+
+    def begin_receive(self, meta: dict, *, sender: str) -> None:
+        """Start a progressive receive; the incoming dims adopt immediately."""
+        self._incoming = ProgressiveFax(
+            meta["width"],
+            meta["height"],
+            threshold=meta["threshold"],
+            invert=meta["invert"],
+        )
+        self._incoming_sender = sender
+        self._incoming_last_render = 0.0
+        self.received_b64 = None
+        self.dimensions = f"{meta['width']}x{meta['height']}"
+        self.payload_size = meta["bytes"]
+        self.status = f"Receiving from {sender}…"
+        self._notify()
+
+    def receive_row(self, row: bytes) -> None:
+        """Append one scanline and (throttled) refresh the partial image."""
+        pf = self._incoming
+        if pf is None:
+            return
+        pf.add_row(row)
+        now = time.monotonic()
+        if pf.is_complete or now - self._incoming_last_render >= _RENDER_INTERVAL:
+            self._incoming_last_render = now
+            self.received_b64 = pf.render_b64()
+            self.status = (
+                f"Receiving from {self._incoming_sender}… "
+                f"line {pf.rows_done}/{pf.rows_total}"
+            )
+            self._notify()
+
+    def finish_receive(self, *, sender: str) -> None:
+        """All rows arrived: promote the buffer to the current fax document."""
+        pf = self._incoming
+        if pf is None:
+            return
+        doc = pf.to_document()
+        self._incoming = None
+        self.current_fax = doc
+        self.received_b64 = render_png_b64(doc)
+        # Mirror onto the Scanned tab and adopt the sender's parameters so
+        # the control bar / JSON export reflect the received document.
+        self.scanned_preview_b64 = self.received_b64
+        self.resolution = doc.width
+        self.threshold = doc.threshold
+        self.invert = doc.invert
+        self.payload_size = doc.payload_size
+        self.dimensions = f"{doc.width}x{doc.height}"
+        self.status = f"Received {self.dimensions} from {sender} ({doc.payload_size} B)."
+        self._notify()
+
+    def abort_receive(self, reason: str) -> None:
+        """Discard the receive buffer (a partial preview stays on screen)."""
+        self._incoming = None
+        self.status = reason
         self._notify()

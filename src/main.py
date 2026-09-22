@@ -1,23 +1,31 @@
-"""Fax machine simulator — full app entry point (Scan + Read).
+"""Fax machine simulator — full app entry point (Scan + Read + P2P line).
 
 Architecture: Control-View-ViewModel (MVVM)
 
     src/
-    ├── main.py                 # ENTRY: full fax (Scan + Read) + Control wiring
+    ├── main.py                 # ENTRY: full fax + Control/line wiring
     ├── fax_reader.py           # ENTRY: read-only standalone + Control wiring
+    ├── network_protocol.py     # FAX1 codec: FaxDocument <-> lanlink handshake
+    ├── lanlink/                # REUSABLE P2P package (stdlib-only, no Flet)
+    │   ├── discovery.py        #   multicast/broadcast beacons + peer table
+    │   ├── session.py          #   ring/BUSY/paced TCP sessions (Connection,
+    │   │                       #   SessionServer, dial)
+    │   └── errors.py           #   LineBusy, PeerGone, HandshakeError, ...
     ├── models/
     │   ├── __init__.py
     │   ├── fax_document.py     # FaxDocument dataclass + JSON (de)serialization
     │   ├── scanner.py          # image → 1-bit packed bitmap (BOX avg per cell)
-    │   └── receiver.py         # packed bitmap → base64 PNG for ft.Image
+    │   └── receiver.py         # packed bitmap → base64 PNG (+ ProgressiveFax)
     ├── viewmodels/
     │   ├── __init__.py
-    │   ├── fax_viewmodel.py    # scan/read state + commands (re-preview on param change)
+    │   ├── fax_viewmodel.py    # scan/read state + commands (+ receive path)
+    │   ├── line_viewmodel.py   # peers, line state, progress, speed toggle
     │   └── reader_viewmodel.py # read-only state + load command
     └── views/
         ├── __init__.py
         ├── components.py       # ImagePanel, StatusBar, ControlBar, spawn()
-        ├── fax_view.py         # build_fax_view: side-by-side Scanned | Received
+        ├── fax_view.py         # build_fax_view: line panel + Scanned | Received
+        ├── line_panel.py       # peer picker, Transmit/Hang up, turbo, status
         └── reader_view.py      # build_reader_view: Load + single image
 
 How it works
@@ -71,6 +79,31 @@ Key design choice: never create one Flet control per pixel. A 1024x1024 fax
 would mean ~1M Container widgets and freeze the UI. Instead, the whole fax is
 decoded into one PIL Image and displayed via a single ft.Image control.
 
+P2P line (Phase 1: LAN only; lanlink/ is stdlib-only and extraction-ready):
+
+    every instance                                   sender            receiver
+        │  Discovery: JSON beacon every 3 s            │                 │
+        │  (multicast default-if + loopback,           │                 │
+        │   broadcast fallback) on UDP 47555           │                 │
+        ▼                                              │                 │
+    peer table (id, name, host, tcp_port, last_seen)    │                 │
+        │  user picks a peer, clicks Transmit          │                 │
+        │                                              │  TCP connect ──▶│
+        │                                              │  FAX1 handshake │
+        │                                              │     busy? ──▶ BUSY + close
+        │                                              │◀── ring delay (2 rings)
+        │                                              │◀── ok           │
+        │  status: RINGING… (waiting for the answer)   │                 │
+        │                                              │  payload rows ─▶│
+        │  paced at ~4 s/page (or Turbo = full speed)  │  ProgressiveFax │
+        │                                              │◀── ok {bytes}   │  line-by-line
+        ▼                                              ▼                 ▼  preview (~40 ms)
+    LineViewModel: IDLE/DIALING/RINGING/SENDING/RECEIVING (+ BUSY, hang-up)
+
+Single line like a real fax: SessionServer.is_busy() answers BUSY whenever
+the line state is not IDLE, and Hang up cancels the active call task.
+Row framing follows the scanner invariant: row size = width // 8 bytes.
+
 MVVM data flow:
 
     User clicks button
@@ -101,12 +134,40 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 
 import flet as ft
 
-from viewmodels import FaxViewModel
+import network_protocol
+from lanlink import (
+    Discovery,
+    HandshakeError,
+    LineBusy,
+    PeerGone,
+    SessionServer,
+    TransferAborted,
+    dial,
+)
+from viewmodels import (
+    DIALING,
+    IDLE,
+    RECEIVING,
+    RINGING,
+    SENDING,
+    FaxViewModel,
+    LineViewModel,
+)
 from views import build_fax_view
 from views.components import spawn
+
+_log = logging.getLogger(__name__)
+
+# Simulated phone-line behavior
+RING_SECONDS = 0.9       # one audible "ring" on the receiver
+RINGS_BEFORE_ANSWER = 2  # auto-answer after this many rings
+PAGE_SECONDS = 4.0       # Normal speed: one page takes about this long
+MIN_BYTES_PER_SEC = 64   # keeps tiny pages from zipping by at full tick rate
 
 
 async def main(page: ft.Page) -> None:
@@ -116,6 +177,8 @@ async def main(page: ft.Page) -> None:
     page.theme_mode = ft.ThemeMode.DARK
 
     vm = FaxViewModel()
+    # Unique default name per process so two instances on one machine differ.
+    line_vm = LineViewModel(name=f"Fax-{os.getpid()}")
 
     file_picker = ft.FilePicker()
     page.services.append(file_picker)
@@ -124,11 +187,11 @@ async def main(page: ft.Page) -> None:
 
     async def on_scan() -> None:
         try:
-            fp = ft.FilePicker()
-            files = await fp.pick_files(
+            files = await file_picker.pick_files(
                 dialog_title="Pick an image to scan",
                 file_type=ft.FilePickerFileType.IMAGE,
                 allow_multiple=False,
+                with_data=True,
             )
         except Exception as ex:
             vm.set_status(f"File picker failed: {type(ex).__name__}: {ex}")
@@ -137,10 +200,12 @@ async def main(page: ft.Page) -> None:
             vm.set_status("Load cancelled.")
             return
         f = files[0]
-        if f.path:
+        if f.bytes:
+            vm.on_source_selected(image_bytes=f.bytes, image_path=f.name)
+        elif f.path:
             vm.on_source_selected(image_path=f.path)
         else:
-            vm.set_status("Scan failed: no file path.")
+            vm.set_status("Scan failed: no file data.")
 
     async def on_scan_run() -> None:
         # Process the already-loaded source image into a fax.
@@ -165,14 +230,8 @@ async def main(page: ft.Page) -> None:
         if not path:
             vm.set_status("Save cancelled.")
             return
-        # On desktop, save_file returns path but doesn't write the file
-        if not page.web:
-            try:
-                with open(path, "w", encoding="utf-8") as fh:
-                    fh.write(json_text)
-            except OSError as ex:
-                vm.set_status(f"Save failed: {ex}")
-                return
+        # src_bytes passed above makes Flet write the file itself on desktop
+        # and download it on web, so there is nothing to write here.
         vm.set_status(f"Saved to {path}")
 
     async def on_load() -> None:
@@ -182,6 +241,7 @@ async def main(page: ft.Page) -> None:
                 file_type=ft.FilePickerFileType.CUSTOM,
                 allowed_extensions=["json"],
                 allow_multiple=False,
+                with_data=True,
             )
         except Exception as ex:
             vm.set_status(f"File picker failed: {ex}")
@@ -190,14 +250,19 @@ async def main(page: ft.Page) -> None:
             vm.set_status("Load cancelled.")
             return
         f = files[0]
-        if f.path:
+        if f.bytes:
+            try:
+                vm.load_fax_from_text(f.bytes.decode("utf-8", errors="replace"))
+            except Exception as ex:
+                vm.set_status(f"Load failed: {ex}")
+        elif f.path:
             try:
                 with open(f.path, "r", encoding="utf-8") as fh:
                     vm.load_fax_from_text(fh.read())
             except OSError as ex:
                 vm.set_status(f"Load failed: {ex}")
         else:
-            vm.set_status("Load failed: no file path.")
+            vm.set_status("Load failed: no file data.")
 
     # ---- Camera ----
     # Camera MUST be in the visual tree (Stack in page controls) to work on web.
@@ -368,6 +433,149 @@ async def main(page: ft.Page) -> None:
         )
     )
 
+    # ---- P2P line: network wiring (Control layer bridges lanlink -> VMs) ----
+
+    _discovery: Discovery | None = None
+    _server: SessionServer | None = None
+    _send_task: asyncio.Task | None = None  # the active outgoing call
+
+    def _line_busy() -> bool:
+        # One line per machine: any non-IDLE state answers BUSY to new calls.
+        return not line_vm.is_idle
+
+    def _on_ringing(header: dict) -> None:
+        sender = str(header.get("sender") or "a peer")
+        line_vm.set_state(RINGING, status=f"Incoming call from {sender}…")
+
+    def _validate(header: dict) -> None:
+        network_protocol.parse_handshake(header)  # raises HandshakeError
+
+    async def _on_incoming(header: dict, conn) -> int:
+        """Runs inside the SessionServer call task: feed rows into the VM as
+        they land on the wire so the received page fills line by line live."""
+        sender, meta = network_protocol.parse_handshake(header)
+        vm.begin_receive(meta, sender=sender)
+        line_vm.set_state(RECEIVING, status=f"Receiving from {sender}…")
+        rs = network_protocol.row_size(meta["width"])
+        total = meta["bytes"]
+        buf = bytearray()
+        rows_fed = 0
+        try:
+            async for chunk in conn.iter_payload(total):
+                buf.extend(chunk)
+                line_vm.set_progress(len(buf), total, rs)
+                # Hand every complete row to the VM the moment it arrives.
+                while len(buf) >= (rows_fed + 1) * rs:
+                    off = rows_fed * rs
+                    vm.receive_row(bytes(buf[off : off + rs]))
+                    rows_fed += 1
+        except asyncio.CancelledError:
+            vm.abort_receive("Receive cancelled — line hung up.")
+            line_vm.set_state(IDLE, status="Hung up during receive.")
+            raise
+        except (TransferAborted, OSError) as ex:
+            vm.abort_receive(f"Receive failed: {ex}")
+            line_vm.set_state(IDLE, status=f"Receive failed: {ex}")
+            return  # connection is broken; the server's finally closes it
+        vm.finish_receive(sender=sender)
+        line_vm.set_state(
+            IDLE, status=f"Received {meta['width']}x{meta['height']} from {sender}."
+        )
+        return total
+
+    async def _start_network() -> None:
+        nonlocal _discovery, _server
+        try:
+            _server = SessionServer(
+                is_busy=_line_busy,
+                on_incoming=_on_incoming,
+                accept_delay=RING_SECONDS * RINGS_BEFORE_ANSWER,
+                on_ringing=_on_ringing,
+                validate=_validate,
+                on_error=lambda ex: _log.warning("incoming call failed: %s", ex),
+            )
+            tcp_port = await _server.start()
+            _discovery = Discovery(
+                name=line_vm.name,
+                tcp_port=tcp_port,
+                on_change=line_vm.set_peers,
+            )
+            await _discovery.start()
+            line_vm.set_status(
+                f"{line_vm.name} is online — select a peer to transmit."
+            )
+        except OSError as ex:
+            line_vm.set_status(f"Network unavailable: {ex}")
+            _log.warning("network start failed", exc_info=ex)
+
+    async def on_transmit() -> None:
+        """Dial the selected peer and stream the scanned fax out."""
+        nonlocal _send_task
+        doc = vm.current_fax
+        peer = line_vm.selected_peer
+        if doc is None:
+            line_vm.set_status("Scan a document before transmitting.")
+            return
+        if peer is None:
+            line_vm.set_status("Select a peer first.")
+            return
+        if not line_vm.is_idle:
+            line_vm.set_status("Line is busy — hang up first.")
+            return
+        _send_task = asyncio.current_task()
+        rs = network_protocol.row_size(doc.width)
+        total = len(doc.data)
+        handshake = network_protocol.build_handshake(doc, sender=line_vm.name)
+        line_vm.set_state(DIALING, status=f"Dialing {peer.name}…")
+        conn = None
+        try:
+            conn = await dial(
+                peer.host,
+                peer.port,
+                handshake,
+                on_waiting=lambda: line_vm.set_status(f"Ringing {peer.name}…"),
+            )
+            line_vm.set_state(SENDING, status=f"Sending to {peer.name}…")
+            bps = None if line_vm.turbo else max(int(total / PAGE_SECONDS), MIN_BYTES_PER_SEC)
+            await conn.send_payload(
+                doc.data,
+                bytes_per_second=bps,
+                on_progress=lambda done, tot: line_vm.set_progress(done, tot, rs),
+            )
+            reply = await conn.recv_json()
+            if reply.get("reply") != "ok" or reply.get("bytes") != total:
+                raise TransferAborted(f"receiver reported {reply!r}")
+        except asyncio.CancelledError:
+            line_vm.set_state(IDLE, status="Hung up.")
+            vm.set_status("Transmission cancelled.")
+            raise
+        except LineBusy:
+            line_vm.set_state(IDLE, status=f"{peer.name} is busy — line in use.")
+        except (PeerGone, HandshakeError, TransferAborted, OSError, asyncio.TimeoutError) as ex:
+            line_vm.set_state(IDLE, status=f"Call failed: {ex}")
+        else:
+            line_vm.set_state(IDLE, status=f"Sent {doc.width}x{doc.height} to {peer.name}.")
+            vm.set_status(f"Sent {doc.width}x{doc.height} to {peer.name}.")
+        finally:
+            # Close on every path — including cancellation — so the receiver
+            # sees the hang-up instead of waiting on a half-open socket.
+            if conn is not None:
+                try:
+                    await conn.close()
+                except Exception:
+                    pass
+            _send_task = None
+
+    async def on_hangup() -> None:
+        """Cancel the active call on either side of the line."""
+        if line_vm.is_idle:
+            return
+        if _send_task is not None:
+            _send_task.cancel()
+        if _server is not None:
+            _server.cancel_active()
+        line_vm.set_state(IDLE, status="Hung up.")
+
     # ---- Build view and add to page ----
     view = build_fax_view(
         page,
@@ -377,7 +585,13 @@ async def main(page: ft.Page) -> None:
         on_save=on_save,
         on_load=on_load,
         extra_buttons=extra_buttons or None,
+        line_vm=line_vm,
+        on_transmit=on_transmit,
+        on_hangup=on_hangup,
     )
+
+    # Discovery + listener run in the background for the page's lifetime.
+    spawn(_start_network)
 
     # Camera stack sits below the main view — invisible until user clicks Camera
     page.add(

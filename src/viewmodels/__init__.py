@@ -11,6 +11,23 @@ can pass through file paths or raw bytes returned by those services.
 """
 
 from .fax_viewmodel import FaxViewModel
+from .line_viewmodel import (
+    DIALING,
+    IDLE,
+    RECEIVING,
+    RINGING,
+    SENDING,
+    LineViewModel,
+)
 from .reader_viewmodel import ReaderViewModel
 
-__all__ = ["FaxViewModel", "ReaderViewModel"]
+__all__ = [
+    "FaxViewModel",
+    "ReaderViewModel",
+    "LineViewModel",
+    "IDLE",
+    "DIALING",
+    "RINGING",
+    "SENDING",
+    "RECEIVING",
+]
