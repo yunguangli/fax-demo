@@ -63,6 +63,20 @@ Each lists the other as a peer within ~3 s. Scan an image in one, select the
 peer, press **Transmit**, and watch the other's *Receive* tab fill line by
 line.
 
+> **Cross-machine play (firewall):** two instances on *one* machine never
+> touch your firewall (loopback is always allowed), but a second device does
+> — each desktop must admit inbound **UDP 47555** (peer beacons) and
+> **TCP 47554** (the call). With ufw:
+>
+> ```bash
+> sudo ufw allow from 192.168.1.0/24 to any port 47555 proto udp comment 'lanlink discovery'
+> sudo ufw allow from 192.168.1.0/24 to any port 47554 proto tcp comment 'lanlink calls'
+> ```
+>
+> Use your own subnet (check with `ip -br addr`). Without the rules the
+> symptom is **one-way discovery**: the other fax sees you, but you never
+> see it.
+
 ## Run the app
 
 ### uv

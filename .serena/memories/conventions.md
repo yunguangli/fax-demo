@@ -3,6 +3,7 @@
 - **Architecture**: Strict MVVM. Models = pure logic. ViewModels = state + commands. Views = UI composition. Control layer (entry files) = async event handlers bridging Flet services (and lanlink network callbacks) to ViewModels.
 - **lanlink boundary**: `src/lanlink/` is stdlib-only and extraction-ready — never import Flet or app modules (`models/`, `viewmodels/`, `views/`, entry files) into it. Fax-specific wire semantics (FAX1 magic, row size = width // 8) live in `src/network_protocol.py`, not in lanlink.
 - **Wire vs storage**: JSON storage stays `version: 1`; the network envelope is separate (FAX1 handshake dict + raw row bytes). Do not conflate them.
+- **Firewall (cross-machine)**: desktop needs inbound ufw rules — UDP `47555` (beacons) + TCP `47554` (calls). Same-host tests never hit this (loopback always allowed), which is why one-way discovery (they see us, we don't see them) means "check the guard at the door" first. `SessionServer.start()` binds fixed `DEFAULT_TCP_PORT = 47554` with ephemeral fallback when taken.
 - **Async**: All Flet entry handlers are `async def`. Camera/FilePicker calls are awaited. Async callbacks spawned from sync `on_click` via `spawn()` (returns/logs task refs; hang-up cancels them).
 - **Type hints**: Used on function signatures. `from __future__ import annotations` in all files.
 - **Docstrings**: Module-level docstrings describe purpose, architecture, and run commands. No per-method docstrings observed.

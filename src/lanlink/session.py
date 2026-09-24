@@ -31,6 +31,8 @@ from typing import AsyncIterator, Awaitable, Callable, Optional
 from .errors import HandshakeError, LineBusy, PeerGone, TransferAborted
 
 CONTROL_FRAME_LIMIT = 64 * 1024
+DEFAULT_TCP_PORT = 47554   # stable call port so LAN firewalls can allow it
+                           # (beacons use DEFAULT_TCP_PORT + 1 = 47555)
 HANDSHAKE_TIMEOUT = 5.0
 REPLY_TIMEOUT = 15.0   # covers the ring delay before the answer
 FINAL_TIMEOUT = 30.0   # receiver renders the finished page before replying
@@ -249,8 +251,22 @@ class SessionServer:
     def running(self) -> bool:
         return self._server is not None
 
-    async def start(self) -> int:
-        """Listen on 0.0.0.0 with an ephemeral port; return the port."""
+    async def start(self, port: int = DEFAULT_TCP_PORT) -> int:
+        """Listen on 0.0.0.0 and return the bound port.
+
+        Prefers the fixed `DEFAULT_TCP_PORT` so cross-machine firewalls can
+        allow a stable port for incoming calls; falls back to an ephemeral
+        port when it is already taken (e.g. a second instance on this host).
+        Pass `port=0` to go straight to an ephemeral port.
+        """
+        if port:
+            try:
+                self._server = await asyncio.start_server(
+                    self._on_client, "0.0.0.0", port
+                )
+                return self._server.sockets[0].getsockname()[1]
+            except OSError:
+                _log.debug("port %s taken, falling back to ephemeral", port)
         self._server = await asyncio.start_server(self._on_client, "0.0.0.0", 0)
         return self._server.sockets[0].getsockname()[1]
 

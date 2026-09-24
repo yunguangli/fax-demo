@@ -30,11 +30,12 @@ from .discovery import (
     Peer,
 )
 from .errors import HandshakeError, LanlinkError, LineBusy, PeerGone, TransferAborted
-from .session import Connection, SessionServer, dial
+from .session import DEFAULT_TCP_PORT, Connection, SessionServer, dial
 
 __all__ = [
     "BEACON_INTERVAL",
     "BEACON_PORT",
+    "DEFAULT_TCP_PORT",
     "MCAST_GRP",
     "PEER_EXPIRY",
     "Discovery",
